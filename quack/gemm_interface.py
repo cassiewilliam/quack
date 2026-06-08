@@ -685,7 +685,13 @@ def gemm_add(
                 (A.shape[0], B.shape[-1]) if A.ndim == 2 else (A.shape[0], A.shape[-2], B.shape[-1])
             )
         out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
-    add_to_output = C is out and isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
+    # NOTE: varlen_k (cu_seqlens_k) is excluded: the in-place TMA-reduce-add path is incorrect/racy
+    # for the per-expert ragged-K output, so route C-is-out accumulate through the gemm_add_out
+    # (C-load + register-add) path instead, which is correct for varlen_k.
+    add_to_output = (
+        C is out and isinstance(beta, float) and beta == 1.0
+        and cu_seqlens_m is None and cu_seqlens_k is None
+    )
     # Empty-input fast path: skip kernel launch (see gemm() for rationale).
     # K=0 reduces D = alpha*A@B + beta*C to D = beta*C.
     if out.numel() == 0:
@@ -955,7 +961,8 @@ def gemm_add_inplace_op(
     fn = gemm_tuned if tuned else partial(gemm_tuned.fn, config=None)
     alpha = _merge_tensor(alpha, alpha_tensor)
     beta = _merge_tensor(beta, beta_tensor)
-    add_to_output = isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None
+    # varlen_k excluded: in-place TMA-reduce-add is incorrect for ragged-K; use gemm_add_out instead.
+    add_to_output = isinstance(beta, float) and beta == 1.0 and cu_seqlens_m is None and cu_seqlens_k is None
     # Use out as both input bias and output
     fn(
         A,
@@ -1743,7 +1750,8 @@ def gemm_add_inplace_fake(
     # commit 290a6a4 for the previous drift bug).
     alpha_val = _merge_tensor(alpha, alpha_tensor)
     beta_val = _merge_tensor(beta, beta_tensor)
-    add_to_output = isinstance(beta_val, float) and beta_val == 1.0 and cu_seqlens_m is None
+    # varlen_k excluded: in-place TMA-reduce-add is incorrect for ragged-K; use gemm_add_out instead.
+    add_to_output = isinstance(beta_val, float) and beta_val == 1.0 and cu_seqlens_m is None and cu_seqlens_k is None
     _precompile_default_config(
         gemm_tuned,
         A,
