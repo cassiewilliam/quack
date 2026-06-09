@@ -1394,7 +1394,15 @@ def gemm_symmetric(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
+    # Exclude configs with per-CTA M (= tile_m // cluster_m) < 128: the SM100 gated postact epilogue
+    # (gemm_act.py GemmGatedMixin.epi_visit_subtile) hard-codes the gate/up register pairing
+    # (rD[4i], rD[4i+2]) for a per-CTA-M>=128 fragment, so per-CTA M=64 (e.g. tile_m=128, cluster_m=2)
+    # mis-pairs gate/up -> wrong postact (rel~0.95) or OOB. Those configs are not faster anyway.
+    configs=[
+        AutotuneConfig(config=c)
+        for c in get_all_configs("gated")
+        if c.tile_m // c.cluster_m >= 128
+    ],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
@@ -2238,7 +2246,15 @@ def gemm_norm_act_tuned(
 
 
 @autotune(
-    configs=[AutotuneConfig(config=c) for c in get_all_configs("gated")],
+    # Exclude configs with per-CTA M (= tile_m // cluster_m) < 128: the SM100 gated postact epilogue
+    # (gemm_act.py GemmGatedMixin.epi_visit_subtile) hard-codes the gate/up register pairing
+    # (rD[4i], rD[4i+2]) for a per-CTA-M>=128 fragment, so per-CTA M=64 (e.g. tile_m=128, cluster_m=2)
+    # mis-pairs gate/up -> wrong postact (rel~0.95) or OOB. Those configs are not faster anyway.
+    configs=[
+        AutotuneConfig(config=c)
+        for c in get_all_configs("gated")
+        if c.tile_m // c.cluster_m >= 128
+    ],
     key=["activation", "dynamic_scheduler"],
     prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
 )
