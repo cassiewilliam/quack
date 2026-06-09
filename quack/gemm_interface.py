@@ -182,7 +182,8 @@ def prune_invalid_gemm_configs(configs, named_args: dict, **kwargs):
     configs = [conf for conf in configs if conf.kwargs["config"].device_capacity == device_capacity]
     gather_A = kwargs.get("A_idx", None) is not None
     varlen_m = kwargs.get("cu_seqlens_m", None) is not None
-    if varlen_m or gather_A:  # Doesn't support swap_ab
+    colvec_scale = kwargs.get("colvec_scale", None) is not None
+    if varlen_m or gather_A or colvec_scale:  # Doesn't support swap_ab
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
     if gather_A:
         configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
@@ -997,6 +998,7 @@ def gemm_act(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L,M)/(total_M,) varlen; per-row post-act mul (gated)
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors."""
     is_gated = activation in gated_to_pytorch_fn_map
@@ -1039,6 +1041,7 @@ def gemm_act(
             dynamic_scheduler,
             tuned,
             concat_layout=concat_str,
+            colvec_scale=colvec_scale,
         )
     else:
         gemm_act_out(
@@ -1421,9 +1424,12 @@ def gemm_gated_tuned(
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L,M)/(total_M,) varlen; per-row post-act mul
 ) -> None:
     if config is None:
         config = default_config(A.device)
+    if colvec_scale is not None:
+        assert not config.swap_ab, "colvec_scale not supported with swap_ab"
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
@@ -1477,6 +1483,7 @@ def gemm_gated_tuned(
         max_swizzle_size=config.max_swizzle_size,
         rowvec_bias=bias if not config.swap_ab else None,
         colvec_bias=bias if config.swap_ab else None,
+        colvec_scale=colvec_scale,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         use_tma_gather=config.use_tma_gather,
@@ -1591,7 +1598,7 @@ def gemm_dgated_tuned(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? colvec_scale=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -1606,6 +1613,7 @@ def gemm_gated_out(
     dynamic_scheduler: bool = False,
     tuned: bool = True,
     concat_layout: Optional[str] = None,
+    colvec_scale: Optional[Tensor] = None,  # (M,) or (L,M)/(total_M,) varlen; per-row post-act mul
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     fn = gemm_gated_tuned if tuned else partial(gemm_gated_tuned.fn, config=None)
@@ -1621,6 +1629,7 @@ def gemm_gated_out(
         A_idx,
         dynamic_scheduler,
         concat_layout=_parse_concat_layout(concat_layout),
+        colvec_scale=colvec_scale,
     )
 
 
