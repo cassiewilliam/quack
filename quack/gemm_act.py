@@ -64,6 +64,10 @@ class GemmActMixin(ComposableEpiMixin):
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
+        # Per-row (M) post-activation scale (e.g. MoE router prob), MULTIPLIED into the postact
+        # output AFTER the activation -- distinct from mColVecBroadcast (a pre-activation bias ADD).
+        # Mirrors the "Scale Out by colvec" path in GemmDGatedMixin (gemm_dact.py).
+        mColVecScale: Optional[cute.Tensor] = None
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
@@ -213,6 +217,7 @@ class GemmGatedMixin(GemmActMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
+        ColVecLoad("mColVecScale"),
         TileStore("mAuxOut", epi_tile_fn=_gated_epi_tile_fn),
     )
 
@@ -262,6 +267,27 @@ class GemmGatedMixin(GemmActMixin):
                 tRS_rAuxOut[2 * i], tRS_rAuxOut[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
+        # Per-row (M) post-activation scale (e.g. MoE router prob): multiply the I-wide gated
+        # postact by colvec_scale AFTER SwiGLU. The colvec is per-row (broadcast over N) and is
+        # partitioned for the FULL 2I acc tile (tRS_rD), so we index it at the SAME tRS_rD
+        # positions the act_fn read for each postact element (postact[2i] came from tRS_rD[4i] on
+        # SM100, tRS_rD[2i] otherwise) -- this gives each postact element its own row's scale
+        # without any 2I->I layout reshape.
+        tDrColVecScale = epi_loop_tensors.get("mColVecScale")
+        if const_expr(tDrColVecScale is not None):
+            if const_expr(self.arch != 100):
+                for i in cutlass.range(cute.size(tRS_rAuxOut), unroll_full=True):
+                    tRS_rAuxOut[i] = tRS_rAuxOut[i] * tDrColVecScale[2 * i].to(
+                        tRS_rAuxOut.element_type
+                    )
+            else:
+                for i in cutlass.range(cute.size(tRS_rAuxOut) // 2, unroll_full=True):
+                    tRS_rAuxOut[2 * i] = tRS_rAuxOut[2 * i] * tDrColVecScale[4 * i].to(
+                        tRS_rAuxOut.element_type
+                    )
+                    tRS_rAuxOut[2 * i + 1] = tRS_rAuxOut[2 * i + 1] * tDrColVecScale[4 * i + 1].to(
+                        tRS_rAuxOut.element_type
+                    )
         return tRS_rAuxOut
 
     @cute.jit
@@ -351,6 +377,8 @@ def _compile_gemm_act(
     rowvec_dtype,
     colvec_dtype,
     colvec_ndim,
+    colvec_scale_dtype,
+    colvec_scale_ndim,
     varlen_m,
     gather_A,
     concat_layout,
@@ -404,6 +432,13 @@ def _compile_gemm_act(
     else:
         mColVec = None
 
+    if colvec_scale_ndim == 2:
+        mColVecScale = fake_tensor(colvec_scale_dtype, (l, m), leading_dim=1, divisibility=4)
+    elif colvec_scale_ndim == 1:
+        mColVecScale = fake_tensor(colvec_scale_dtype, (m,), leading_dim=0, divisibility=4)
+    else:
+        mColVecScale = None
+
     act_fn = act_fn_map[activation] if gemm_cls_name == "act" else gate_fn_map[activation]
 
     def fake_scalar(mode, dtype=Int32):
@@ -419,6 +454,7 @@ def _compile_gemm_act(
         act_fn,
         mRowVecBroadcast=mRowVec,
         mColVecBroadcast=mColVec,
+        mColVecScale=mColVecScale,
         rounding_mode=rounding_mode,
         sr_seed=fake_scalar(sr_seed_mode),
     )
@@ -467,6 +503,7 @@ def gemm_act(
     max_swizzle_size: int = 8,
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
+    colvec_scale: Optional[Tensor] = None,  # (l, m) or (total_m,) if varlen_m; per-row post-act mul (gated)
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     rounding_mode: int = RoundingMode.RN,
@@ -510,6 +547,8 @@ def gemm_act(
     c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
+    colvec_scale_ndim = colvec_scale.ndim if colvec_scale is not None else 0
+    assert colvec_scale is None or gemm_cls_name == "gated", "colvec_scale only supported for gated"
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
@@ -547,6 +586,8 @@ def gemm_act(
         torch2cute_dtype_map[rowvec_bias.dtype] if rowvec_bias is not None else None,
         torch2cute_dtype_map[colvec_bias.dtype] if colvec_bias is not None else None,
         colvec_ndim,
+        torch2cute_dtype_map[colvec_scale.dtype] if colvec_scale is not None else None,
+        colvec_scale_ndim,
         varlen_m,
         gather_A,
         concat_layout,
@@ -577,6 +618,7 @@ def gemm_act(
         None,  # act_fn is Constexpr, pass None at call time
         mRowVecBroadcast=rowvec_bias,
         mColVecBroadcast=colvec_bias,
+        mColVecScale=colvec_scale,
         rounding_mode=None,  # Constexpr, pass None at call time
         sr_seed=scalar_arg(sr_seed, sr_seed_mode),
     )

@@ -268,6 +268,7 @@ class Autotuner:
         prune_configs_by: Optional[Dict] = None,
         do_bench=None,
         cache_results=False,
+        key_ignore_varlen_dim=False,
     ):
         """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
@@ -281,6 +282,7 @@ class Autotuner:
             self.configs = configs
         signature = inspect.signature(fn)
         self.keys = key
+        self.key_ignore_varlen_dim = key_ignore_varlen_dim
         self.cache: Dict[Tuple, AutotuneConfig] = {}
         self.arg_names = list(signature.parameters.keys())
         self.cache_results = (
@@ -611,10 +613,41 @@ class Autotuner:
             _args = {k: v for (k, v) in all_args.items() if k in self.arg_names}
             # Need "str" to make it json-serializable
             key = [str(_args[key]) for key in self.keys if key in _args]
+            # Varlen/grouped gemms (ragged MoE) get a different ragged token count every iter -- the
+            # M dim for fwd/dgrad, the K (contraction) dim for wgrad. Keying on it re-tunes forever
+            # (never converges; the ragged distribution spans a wide range so even pow2-bucketing
+            # leaves dozens of keys). But the optimal grouped-gemm config is token-count-INVARIANT:
+            # the persistent scheduler tiles any count at runtime, and the config is set by the fixed
+            # feature dims (N, K) + activation + scheduler. So when this is a varlen call (a
+            # cu_seqlens arg is present) we drop the token dim from the key -> tune once per
+            # (feature dims, activation, scheduler) and converge to a handful of tunes. The token
+            # count is the leading dim of the first tensor arg (the activation A/x/dY); we drop
+            # EVERY dim equal to it so it also covers out[M,N] and the 1-D colvec_scale[M]. Gated on
+            # cu_seqlens so plain (non-grouped) gemms are unaffected.
+            tok = None
+            if self.key_ignore_varlen_dim and any(
+                _args.get(k) is not None for k in ("cu_seqlens_m", "cu_seqlens_k")
+            ):
+                # The ragged token count is the LARGEST tensor dim: for grouped MoE the total token
+                # count (>= tens of thousands) dwarfs the feature dims (N, K, 2I <= a few thousand)
+                # and the group count G. Take the max (not arg0.shape[0]) so it is robust to which
+                # tensor/dim holds the token count -- crucially the wgrad's varlen-K *contraction*
+                # dim and swap_ab transposed layouts, where the token dim is NOT the first arg's
+                # leading dim. Dropping every dim == tok removes varlen-M, varlen-K and the 1-D
+                # colvec_scale[M] from the key in one shot.
+                for a in _args.values():
+                    if isinstance(a, Tensor):
+                        for s in a.shape:
+                            if tok is None or s > tok:
+                                tok = s
             for _, arg in _args.items():
                 if isinstance(arg, Tensor):
-                    key.append(str(arg.shape))
-                    # If stride != 0, 1, we just cache it as 2
+                    if tok is not None:
+                        key.append(str(tuple(s for s in arg.shape if s != tok)))
+                    else:
+                        key.append(str(arg.shape))
+                    # If stride != 0, 1, we just cache it as 2 (already token-count-independent:
+                    # the token dim's stride is the fixed feature size -> normalized to 2).
                     key.append(str([s if s in {0, 1} else 2 for s in arg.stride()]))
                     key.append(str(arg.dtype))
             key = tuple(key)
@@ -805,7 +838,8 @@ class AutotuneConfig:
 
 
 def autotune(
-    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True
+    configs, key=None, prune_configs_by=None, restore_value=None, do_bench=None, cache_results=True,
+    key_ignore_varlen_dim=False,
 ):
     f"""
     Decorator for auto-tuning a function function.
@@ -844,6 +878,7 @@ def autotune(
             prune_configs_by=prune_configs_by,
             do_bench=do_bench,
             cache_results=cache_results,
+            key_ignore_varlen_dim=key_ignore_varlen_dim,
         )
 
     return decorator
